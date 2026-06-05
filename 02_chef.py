@@ -5,7 +5,7 @@ import streamlit as st
 import torch
 import pandas as pd
 import numpy as np
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from datasets import load_dataset
@@ -18,100 +18,92 @@ HISTORIAL_FILE = 'historial_cocina.json'
 
 st.set_page_config(page_title='Chef Rapidín V2', page_icon='🍳', layout='centered')
 
-
-
-
-
-
-
 # -----------------------------------------------------------------------------
 # CARGA DE RECURSOS (Modelo + RAG + Dataset)
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def cargar_recursos():
-    # Modelo IA
     model_id = 'Qwen/Qwen2.5-3B-Instruct'
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type='nf4',
+        bnb_4bit_use_double_quant=True
+    )
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.float16,
+        quantization_config=quantization_config,
         device_map='auto',
-        trust_remote_code=True,
-        load_in_4bit=True
+        trust_remote_code=True
     )
-    # Modelo Embedding para RAG
+    
     retriever = SentenceTransformer('all-MiniLM-L6-v2')
     return tokenizer, model, retriever
 
 @st.cache_data
 def cargar_y_preparar_dataset():
-    # Cargamos solo la sección de entrenamiento
     ds = load_dataset('datahiveai/recipes-with-nutrition', split='train')
-    
-    # Convertimos a DataFrame de Pandas y limitamos a 8000 filas para optimizar
     df = pd.DataFrame(ds).head(8000)
     
-    # Limpieza básica de strings para asegurar que las búsquedas no fallen por nulos
-    df['recipe_name'] = df['recipe_name'].fillna('')
-    df['ingredients'] = df['ingredients'].fillna('')
-    df['health_labels'] = df['health_labels'].fillna('')
-    df['dish_type'] = df['dish_type'].fillna('')
-    df['meal_type'] = df['meal_type'].fillna('')
-    df['ingredient_lines'] = df['ingredient_lines'].fillna('')
+    mapeo_columnas = {
+        'recipe_name': 'title',
+        'ingredient_lines': 'instructions',
+        'ingredients': 'ingredients',
+        'health_labels': 'health_labels',
+        'dish_type': 'dish_type',
+        'meal_type': 'meal_type'
+    }
     
-    return df
+    df = df.rename(columns=mapeo_columnas)
+    columnas_finales = ['title', 'ingredients', 'health_labels', 'dish_type', 'meal_type', 'instructions']
+    
+    for col in columnas_finales:
+        if col not in df.columns:
+            df[col] = ''
+        else:
+            df[col] = df[col].fillna('')
+            
+    return df[columnas_finales]
 
+# Inicialización segura y secuencial de las variables globales
 try:
     tokenizer, model, retriever = cargar_recursos()
     df_recetas = cargar_y_preparar_dataset()
-    
-    # Movemos la inicialización aquí dentro para asegurar el orden de ejecución
-    @st.cache_resource
-    def cargar_embeddings():
-        recetas_text = [
-            f"Nombre: {row['recipe_name']} | Ingredientes: {row['ingredients']} | Dieta: {row['health_labels']} | Tipo: {row['dish_type']} {row['meal_type']}"
-            for _, row in df_recetas.iterrows()
-        ]
-        return retriever.encode(recetas_text, convert_to_numpy=True)
-
-    embeddings_recetas = cargar_embeddings()
-
 except Exception as e:
     st.error(f'❌ Error de inicialización: {e}')
     st.stop()
 
-
 # -----------------------------------------------------------------------------
-# LÓGICA RAG UPTIMIZADA
+# LÓGICA RAG OPTIMIZADA
 # -----------------------------------------------------------------------------
 @st.cache_resource
-def cargar_embeddings():
-    # Creamos un texto rico combinando los campos clave solicitados
+def generar_embeddings_globales(_df_origen):
+    # Usamos las columnas mapeadas finales ('title', etc.)
     recetas_text = [
-        f"Nombre: {row['recipe_name']} | Ingredientes: {row['ingredients']} | Dieta: {row['health_labels']} | Tipo: {row['dish_type']} {row['meal_type']}"
-        for _, row in df_recetas.iterrows()
+        f"Nombre: {row['title']} | Ingredientes: {row['ingredients']} | Dieta: {row['health_labels']} | Tipo: {row['dish_type']} {row['meal_type']}"
+        for _, row in _df_origen.iterrows()
     ]
     return retriever.encode(recetas_text, convert_to_numpy=True)
 
-# Inicializar los embeddings una sola vez
-embeddings_recetas = cargar_embeddings()
+# Creamos los embeddings pasando el DataFrame ya inicializado de forma segura
+embeddings_recetas = generar_embeddings_globales(df_recetas)
 
 def obtener_contexto(query, df_filtrado, embeddings_filtrados):
     if df_filtrado.empty:
         return 'No se encontraron recetas que cumplan con los filtros de dieta o alergias.'
         
-    # Vectorizar la consulta del usuario usando el retriever global
     embedding_query = retriever.encode([query], convert_to_numpy=True)
-    
-    # Calcular similitud solo con las filas que pasaron el filtro
     similitudes = cosine_similarity(embedding_query, embeddings_filtrados)
     
-    # Tomar el top 2 o el máximo disponible si hay menos de 2
     top_k = min(2, len(df_filtrado))
     indices = np.argsort(similitudes[0])[-top_k:]
     
+    # Corregido aquí para usar las columnas unificadas ('title' e 'instructions')
     contexto = '\n'.join([
-        f"- {df_filtrado.iloc[i]['recipe_name']} (Tipo: {df_filtrado.iloc[i]['meal_type']}/{df_filtrado.iloc[i]['dish_type']}): {df_filtrado.iloc[i]['instructions']}"
+        f"- {df_filtrado.iloc[i]['title']} (Tipo: {df_filtrado.iloc[i]['meal_type']}/{df_filtrado.iloc[i]['dish_type']}): {df_filtrado.iloc[i]['instructions']}"
         for i in indices
     ])
     return contexto
@@ -140,7 +132,6 @@ def guardar_en_historial(plato, ingredientes, tecnica):
 st.title('🍳 Chef Rapidín V2')
 historial_previo = cargar_historial()
 
-# Nuevos selectores en la UI para Alergias y Dietas
 st.sidebar.header('⚙️ Filtros de Salud y Dieta')
 
 alergias = st.sidebar.text_input('Alergias / Excluir (ej: Peanut, Milk, Gluten)', value='')
@@ -159,24 +150,32 @@ momento_dia = st.sidebar.selectbox(
 ingredientes_usuario = st.text_input('¿Qué tienes por ahí tirado?', value='rice, tuna, onion')
 
 if st.button('⚡ Generar recetas'):
-    # --- PROCESO DE FILTRADO PRE-RAG ---
     df_filtrado = df_recetas.copy()
     indices_validos = np.arange(len(df_recetas))
     
-    # 1. Filtro de Alergias (Exclusión)
-    if alergias:
-        lista_alergias = [a.strip().lower() for a in alergias.split(',') if a.strip()]
-        for alergia in lista_alergias:
-            mask = ~df_filtrado['ingredients'].str.lower().str.contains(alergia) & ~df_filtrado['health_labels'].str.lower().str.contains(alergia)
-            df_filtrado = df_filtrado[mask]
-            indices_validos = indices_validos[mask]
-
-    # 2. Filtro de Tipo de Dieta (Inclusión)
+    # --- COPIA LIMPIA DE INGREDIENTES DEL USUARIO ---
+    ingredientes_ia = ingredientes_usuario
+    
+    # 2. Filtro de Tipo de Dieta (Inclusión) + Limpieza de ingredientes en conflicto
     if tipo_dieta:
         for dieta in tipo_dieta:
             mask = df_filtrado['health_labels'].str.upper().str.contains(dieta)
             df_filtrado = df_filtrado[mask]
             indices_validos = indices_validos[mask]
+        
+        # Si el usuario quiere algo Vegano o Vegetariano, purgamos la carne/pescado del input
+        dietas_strings = [d.upper() for d in tipo_dieta]
+        if 'VEGAN' in dietas_strings or 'VEGETARIAN' in dietas_strings:
+            # Lista de cosas que NO pueden ir bajo ningún concepto
+            prohibidos = ['tuna', 'chicken', 'beef', 'pork', 'salmon', 'fish', 'meat', 'ham', 'jamon']
+            if 'VEGAN' in dietas_strings:
+                # Si es vegano estricto, sumamos lácteos, huevos y quesos
+                prohibidos += ['cheese', 'egg', 'milk', 'butter', 'queso', 'huevo', 'yogurt']
+            
+            # Filtramos la cadena de texto que va a leer el modelo
+            palabras_usuario = [p.strip() for p in ingredientes_usuario.split(',')]
+            palabras_limpias = [p for p in palabras_usuario if p.lower() not in prohibidos]
+            ingredientes_ia = ', '.join(palabras_limpias)
             
     # 3. Filtro de Momento del Día
     if momento_dia != 'Cualquiera':
@@ -184,10 +183,7 @@ if st.button('⚡ Generar recetas'):
         df_filtrado = df_filtrado[mask]
         indices_validos = indices_validos[mask]
 
-    # Obtener subconjunto de embeddings para el cálculo de similitud corregido
     embeddings_filtrados = embeddings_recetas[indices_validos]
-
-    # Obtener Contexto RAG optimizado con los filtros aplicados
     contexto_rag = obtener_contexto(ingredientes_usuario, df_filtrado, embeddings_filtrados)
     texto_historial = ', '.join([f"{h['plato']} ({h['tecnica']})" for h in historial_previo])
 
@@ -202,27 +198,61 @@ if st.button('⚡ Generar recetas'):
     - REGLA DE SALUD CRÍTICA: No utilices bajo ningún concepto ingredientes prohibidos por el usuario. Alergias a evitar: {alergias}. Dieta obligatoria: {', '.join(tipo_dieta)}.
     - Respuesta SOLO en JSON. Sin texto adicional ni bloques de código markdown extraños.
     - Humor sarcástico e irónico fuerte.
+    - Asegúrate de que las acciones culinarias en español tengan sentido (usa verbos como picar, trocear, batir, nunca inventos raros).
     - Formato JSON con claves: opcion_1, opcion_2, opcion_3. Cada una con nombre, tecnica, tiempo, pasos (lista).
     """
 
     messages = [
         {'role': 'system', 'content': system_prompt},
-        {'role': 'user', 'content': f'Ingredientes disponibles: {ingredientes_usuario}. Momento del día deseado: {momento_dia}.'}
+        {'role': 'user', 'content': f'Ingredientes disponibles: {ingredientes_ia}. Momento del día deseado: {momento_dia}.'}
     ]
 
+    # Ahora a ver si parsea el JSON BIEN
     with st.spinner('🧠 Cocinando con RAG y filtrado inteligente...'):
-        inputs = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors='pt').to(model.device)
-        outputs = model.generate(inputs, max_new_tokens=800, temperature=0.7, do_sample=True, pad_token_id=tokenizer.eos_token_id)
+        # Generamos los inputs y obtenemos explícitamente la attention_mask
+        inputs = tokenizer.apply_chat_template(
+            messages, 
+            tokenize=True, 
+            add_generation_prompt=True, 
+            return_tensors='pt'
+        ).to(model.device)
+        
+        # Creamos la máscara de atención para que el modelo no se confunda con el pad_token
+        attention_mask = (inputs != tokenizer.pad_token_id).long().to(model.device)
+        
+        outputs = model.generate(
+            inputs,
+            attention_mask=attention_mask,  # Pasamos la máscara aquí
+            max_new_tokens=1000,            # Le damos un pelín más de margen para recetas largas
+            temperature=0.3,                # Bajamos la temperatura para que sea más preciso con el JSON
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+        
         texto_generado = tokenizer.decode(outputs[0][inputs.shape[1]:], skip_special_tokens=True)
         
-        # Limpieza JSON
+        # Limpieza y parseo ultra robusto de JSON
         try:
-            inicio, fin = texto_generado.find('{'), texto_generado.rfind('}') + 1
-            recetas = json.loads(texto_generado[inicio:fin])
+            # Quitamos posibles bloques de markdown que meta el modelo por su cuenta
+            texto_limpio = texto_generado.strip()
+            if texto_limpio.startswith('```json'):
+                texto_limpio = texto_limpio[7:]
+            if texto_limpio.startswith('```'):
+                texto_limpio = texto_limpio[3:]
+            if texto_limpio.endswith('```'):
+                texto_limpio = texto_limpio[:-3]
+            texto_limpio = texto_limpio.strip()
+
+            inicio, fin = texto_limpio.find('{'), texto_limpio.rfind('}') + 1
+            recetas = json.loads(texto_limpio[inicio:fin])
+            
             st.session_state['recetas_generadas'] = recetas
             st.session_state['ingredientes_usados'] = ingredientes_usuario
-        except:
-            st.error('Error al generar o parsear el JSON de la receta.')
+        except Exception as json_err:
+            st.error('Error al parsear el JSON de la receta.')
+            # Te muestra en la web qué ha respondido el modelo exactamente para poder auditarlo
+            with st.expander('🔍 Ver respuesta en bruto del Chef'):
+                st.code(texto_generado, language='json')
 
 # -----------------------------------------------------------------------------
 # RENDERIZADO
