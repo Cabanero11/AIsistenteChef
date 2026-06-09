@@ -16,7 +16,7 @@ from datasets import load_dataset
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 HISTORIAL_FILE = 'historial_cocina.json'
 
-st.set_page_config(page_title='Chef Rapidín V2', page_icon='🍳', layout='centered')
+st.set_page_config(page_title='Chef Rapidín', page_icon='🍳', layout='centered')
 
 # -----------------------------------------------------------------------------
 # CARGA DE RECURSOS (Modelo + RAG + Dataset)
@@ -108,6 +108,19 @@ def obtener_contexto(query, df_filtrado, embeddings_filtrados):
     ])
     return contexto
 
+# Para identificar alergias
+def limpiar_ingredientes(ingredientes_usuario, alergias_usuario):
+    if not alergias_usuario:
+        return ingredientes_usuario
+    
+    lista_alergias = [a.strip().lower() for a in alergias_usuario.split(",")]
+    palabras_usuario = [p.strip() for p in ingredientes_usuario.split(",")]
+    
+    # Filtramos la lista eliminando lo que el usuario puso en "alergias"
+    ingredientes_limpios = [p for p in palabras_usuario if p.lower() not in lista_alergias]
+    
+    return ", ".join(ingredientes_limpios)
+
 # -----------------------------------------------------------------------------
 # HISTORIAL
 # -----------------------------------------------------------------------------
@@ -129,7 +142,7 @@ def guardar_en_historial(plato, ingredientes, tecnica):
 # -----------------------------------------------------------------------------
 # INTERFAZ DE USUARIO
 # -----------------------------------------------------------------------------
-st.title('🍳 Chef Rapidín V2')
+st.title('🍳 Chef Rapidín')
 historial_previo = cargar_historial()
 
 st.sidebar.header('⚙️ Filtros de Salud y Dieta')
@@ -154,7 +167,7 @@ if st.button('⚡ Generar recetas'):
     indices_validos = np.arange(len(df_recetas))
     
     # --- COPIA LIMPIA DE INGREDIENTES DEL USUARIO ---
-    ingredientes_ia = ingredientes_usuario
+    ingredientes_ia = limpiar_ingredientes(ingredientes_usuario, alergias)
     
     # 2. Filtro de Tipo de Dieta (Inclusión) + Limpieza de ingredientes en conflicto
     if tipo_dieta:
@@ -195,6 +208,7 @@ if st.button('⚡ Generar recetas'):
     
     Reglas estrictas:
     - Si las recetas de referencia usan ingredientes que tengo, úsalas.
+    - NUNCA, bajo ningún concepto, incluyas estos ingredientes prohibidos
     - REGLA DE SALUD CRÍTICA: No utilices bajo ningún concepto ingredientes prohibidos por el usuario. Alergias a evitar: {alergias}. Dieta obligatoria: {', '.join(tipo_dieta)}.
     - Respuesta SOLO en JSON. Sin texto adicional ni bloques de código markdown extraños.
     - Humor sarcástico e irónico fuerte.
@@ -208,7 +222,7 @@ if st.button('⚡ Generar recetas'):
     ]
 
     # Ahora a ver si parsea el JSON BIEN
-    with st.spinner('🧠 Cocinando con RAG y filtrado inteligente...'):
+    with st.spinner('🧠 Cocinando algo rico ...'):
         # Generamos los inputs y obtenemos explícitamente la attention_mask
         inputs = tokenizer.apply_chat_template(
             messages, 
